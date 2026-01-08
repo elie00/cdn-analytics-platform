@@ -1,0 +1,240 @@
+{
+  "dashboard": {
+    "title": "CDN NOC - Real-time Performance",
+    "tags": ["cdn", "noc", "realtime"],
+    "timezone": "browser",
+    "editable": true,
+    "hideControls": false,
+    "sharedCrosshair": true,
+    "refresh": "10s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Global Overview",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 0, "w": 24, "h": 4},
+        "targets": [
+          {
+            "refId": "A",
+            "queryType": "timeSeriesQuery",
+            "query": "SELECT SUM(total_requests) as requests FROM cdn_realtime_metrics WHERE timestamp >= NOW() - INTERVAL 1 MINUTE"
+          }
+        ],
+        "options": {
+          "graphMode": "area",
+          "colorMode": "value",
+          "orientation": "horizontal"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 80000, "color": "yellow"},
+                {"value": 100000, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Average Latency by POP",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "query": "SELECT pop, AVG(avg_latency_ms) as latency FROM cdn_realtime_metrics GROUP BY pop"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms",
+            "min": 0,
+            "max": 500,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 200, "color": "yellow"},
+                {"value": 400, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Error Rate by POP",
+        "type": "timeseries",
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "query": "SELECT pop, AVG(error_rate) as error_rate FROM cdn_realtime_metrics GROUP BY pop"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percentunit",
+            "min": 0,
+            "max": 0.1,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 0.01, "color": "yellow"},
+                {"value": 0.05, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Global CDN Map",
+        "type": "geomap",
+        "gridPos": {"x": 0, "y": 12, "w": 24, "h": 12},
+        "targets": [
+          {
+            "refId": "A",
+            "query": "SELECT pop, latitude, longitude, avg_latency_ms FROM cdn_realtime_metrics"
+          }
+        ],
+        "options": {
+          "view": {
+            "id": "coords",
+            "lat": 48,
+            "lon": 2,
+            "zoom": 4
+          },
+          "basemap": {
+            "type": "default"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "hideFrom": {
+                "tooltip": false,
+                "viz": false,
+                "legend": false
+              }
+            },
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 200, "color": "yellow"},
+                {"value": 400, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": {"x": 0, "y": 24, "w": 8, "h": 6},
+        "targets": [
+          {
+            "refId": "A",
+            "query": "SELECT AVG(cache_hit_rate) as cache_hit_rate FROM cdn_realtime_metrics"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percentunit",
+            "min": 0,
+            "max": 1,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 0.7, "color": "yellow"},
+                {"value": 0.85, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "title": "Active Anomalies",
+        "type": "table",
+        "gridPos": {"x": 8, "y": 24, "w": 16, "h": 6},
+        "targets": [
+          {
+            "refId": "A",
+            "queryType": "sql",
+            "rawSql": "SELECT detected_at, pop, anomaly_type, severity, description FROM `cdn_analytics.anomalies` WHERE resolved_at IS NULL ORDER BY detected_at DESC LIMIT 10"
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "sortBy": [{"field": "detected_at", "desc": true}]
+        }
+      },
+      {
+        "id": 7,
+        "title": "Bandwidth Usage",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 30, "w": 24, "h": 8},
+        "targets": [
+          {
+            "refId": "A",
+            "query": "SELECT pop, SUM(total_bytes_sent) / 1e9 as bandwidth_gbps FROM cdn_realtime_metrics GROUP BY pop"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "gbits",
+            "min": 0
+          }
+        }
+      }
+    ],
+    "annotations": {
+      "list": [
+        {
+          "name": "Anomalies",
+          "datasource": "BigQuery",
+          "enable": true,
+          "iconColor": "red",
+          "query": "SELECT detected_at as time, description as text, pop as tags FROM `cdn_analytics.anomalies` WHERE detected_at >= $__from AND detected_at <= $__to"
+        }
+      ]
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "pop",
+          "label": "POP",
+          "type": "query",
+          "query": "SELECT DISTINCT pop FROM cdn_realtime_metrics",
+          "multi": true,
+          "includeAll": true
+        },
+        {
+          "name": "datacenter",
+          "label": "Datacenter",
+          "type": "query",
+          "query": "SELECT DISTINCT datacenter FROM cdn_realtime_metrics",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    }
+  }
+}

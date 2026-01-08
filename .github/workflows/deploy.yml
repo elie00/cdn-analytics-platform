@@ -1,0 +1,312 @@
+name: Deploy CDN Analytics Platform
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: europe-west1
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # Job 1: Tests et validation
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock flake8 black mypy
+      
+      - name: Run linting
+        run: |
+          flake8 pipelines/ api/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          black --check pipelines/ api/
+      
+      - name: Run unit tests
+        run: |
+          pytest tests/ --cov=pipelines --cov=api --cov-report=xml --cov-report=html
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+      
+      - name: Validate Dataflow pipelines
+        run: |
+          python pipelines/dataflow/enrichment_pipeline.py \
+            --runner=DirectRunner \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --dry_run=True
+
+  # Job 2: Terraform validation
+  terraform:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Terraform Init
+        working-directory: infrastructure/terraform
+        run: terraform init
+      
+      - name: Terraform Format Check
+        working-directory: infrastructure/terraform
+        run: terraform fmt -check
+      
+      - name: Terraform Validate
+        working-directory: infrastructure/terraform
+        run: terraform validate
+      
+      - name: Terraform Plan
+        working-directory: infrastructure/terraform
+        run: |
+          terraform plan \
+            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
+            -var="environment=staging" \
+            -out=tfplan
+      
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infrastructure/terraform/tfplan
+
+  # Job 3: Deploy Infrastructure
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [test, terraform]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Terraform Init
+        working-directory: infrastructure/terraform
+        run: terraform init
+      
+      - name: Terraform Apply
+        working-directory: infrastructure/terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
+            -var="environment=prod" \
+            -var="pagerduty_service_key=${{ secrets.PAGERDUTY_KEY }}" \
+            -var="slack_webhook_url=${{ secrets.SLACK_WEBHOOK }}"
+
+  # Job 4: Deploy Dataflow Pipelines
+  deploy-dataflow:
+    name: Deploy Dataflow Pipelines
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Deploy Enrichment Pipeline
+        run: |
+          python pipelines/dataflow/enrichment_pipeline.py \
+            --runner=DataflowRunner \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --region=${{ env.GCP_REGION }} \
+            --job_name=cdn-enrichment-$(date +%s) \
+            --temp_location=gs://${{ env.GCP_PROJECT_ID }}-dataflow-temp/temp \
+            --staging_location=gs://${{ env.GCP_PROJECT_ID }}-dataflow-staging/staging \
+            --num_workers=20 \
+            --max_num_workers=100 \
+            --autoscaling_algorithm=THROUGHPUT_BASED \
+            --worker_machine_type=n2-standard-4 \
+            --service_account_email=${{ secrets.DATAFLOW_SA_EMAIL }} \
+            --update
+      
+      - name: Deploy Anomaly Detection Pipeline
+        run: |
+          python pipelines/dataflow/anomaly_detection_pipeline.py \
+            --runner=DataflowRunner \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --region=${{ env.GCP_REGION }} \
+            --job_name=cdn-anomaly-detection-$(date +%s) \
+            --temp_location=gs://${{ env.GCP_PROJECT_ID }}-dataflow-temp/temp \
+            --staging_location=gs://${{ env.GCP_PROJECT_ID }}-dataflow-staging/staging \
+            --num_workers=10 \
+            --max_num_workers=50 \
+            --service_account_email=${{ secrets.DATAFLOW_SA_EMAIL }} \
+            --update
+
+  # Job 5: Build and Deploy API
+  deploy-api:
+    name: Build and Deploy API
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker
+        run: gcloud auth configure-docker gcr.io
+      
+      - name: Build Docker image
+        working-directory: api
+        run: |
+          docker build \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/routing-api:${{ github.sha }} \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/routing-api:latest \
+            .
+      
+      - name: Push Docker image
+        run: |
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/routing-api:${{ github.sha }}
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/routing-api:latest
+      
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy routing-api \
+            --image gcr.io/${{ env.GCP_PROJECT_ID }}/routing-api:${{ github.sha }} \
+            --platform managed \
+            --region ${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --memory 2Gi \
+            --cpu 2 \
+            --min-instances 2 \
+            --max-instances 20 \
+            --concurrency 100 \
+            --service-account ${{ secrets.API_SA_EMAIL }} \
+            --set-env-vars "GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},REDIS_HOST=${{ secrets.REDIS_HOST }}"
+
+  # Job 6: Deploy SQL Models
+  deploy-sql:
+    name: Deploy SQL Models and Views
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Deploy Materialized Views
+        run: |
+          bq query --use_legacy_sql=false < sql/materialized_views/hourly_pop_performance.sql
+      
+      - name: Deploy ML Models
+        run: |
+          bq query --use_legacy_sql=false < sql/ml_models/load_prediction.sql
+
+  # Job 7: Smoke Tests
+  smoke-tests:
+    name: Run Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-api, deploy-dataflow]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Test API Health
+        run: |
+          API_URL="https://routing-api-${{ secrets.CLOUD_RUN_SERVICE_HASH }}-ew.a.run.app"
+          curl -f $API_URL/health || exit 1
+      
+      - name: Test API Endpoints
+        run: |
+          API_URL="https://routing-api-${{ secrets.CLOUD_RUN_SERVICE_HASH }}-ew.a.run.app"
+          curl -f "$API_URL/api/v1/best-pop?client_ip=8.8.8.8" || exit 1
+          curl -f "$API_URL/api/v1/stats/global" || exit 1
+      
+      - name: Notify Success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"✅ CDN Analytics Platform deployed successfully to production!"}'
+      
+      - name: Notify Failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"❌ CDN Analytics Platform deployment FAILED!"}'

@@ -1,0 +1,8 @@
+flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
+google-cloud-bigtable==2.23.0
+google-cloud-bigquery==3.14.0
+redis==5.0.1
+maxminddb==2.5.2
+prometheus-client==0.19.0
